@@ -637,114 +637,69 @@ async def scrape_url(req: ScrapeRequest):
 
 
 # ══════════════════════════════════════════════════════════════
-#  VIDEO GENERATION — HuggingFace → Replicate → Wan2.2
-#  Mirrors: InferenceClient(provider="replicate").text_to_video()
+#  VIDEO GENERATION — HuggingFace SDK → Replicate → Wan2.2-T2V-A14B
+#
+#  HF token comes from Flutter (admin sets it in Admin Panel →
+#  saved to Firestore system_config/video_config → Flutter reads
+#  it and passes as hf_token in request body).
+#
+#  Exact same as working Colab:
+#    from huggingface_hub import InferenceClient
+#    client = InferenceClient(provider="replicate", api_key=hf_token)
+#    video = client.text_to_video("...", model="Wan-AI/Wan2.2-T2V-A14B")
 # ══════════════════════════════════════════════════════════════
 class VideoGenerateRequest(BaseModel):
     prompt: str
-    hf_token: str
+    hf_token: str  # from Admin Panel → Firestore → Flutter
 
 @app.post("/generate-video")
 async def generate_video(req: VideoGenerateRequest):
-    """
-    Generates a short video clip via HuggingFace router → Replicate → Wan2.2-T2V-A14B.
-    Returns base64-encoded mp4 video bytes.
-    """
-    model = "Wan-AI/Wan2.2-T2V-A14B"
-    full_prompt = f"{req.prompt}. Cinematic, dramatic lighting, smooth camera motion, Instagram reel style, 5 seconds."
-
-    headers = {
-        "Authorization": f"Bearer {req.hf_token}",
-        "Content-Type": "application/json",
-        "x-provider": "replicate",
-    }
-
-    async with httpx.AsyncClient(timeout=300) as client:
-        # Submit the generation job
-        resp = await client.post(
-            f"https://router.huggingface.co/models/{model}",
-            headers=headers,
-            json={"inputs": full_prompt},
-        )
-
-        if resp.status_code == 200:
-            ct = resp.headers.get("content-type", "")
-            if "video" in ct:
-                import base64
-                return {
-                    "success": True,
-                    "video_b64": base64.b64encode(resp.content).decode(),
-                    "content_type": "video/mp4",
-                }
-            # JSON response — may have url or request_id
-            try:
-                data = resp.json()
-                if isinstance(data, dict):
-                    if data.get("url"):
-                        return {"success": True, "video_url": data["url"]}
-                    if data.get("video"):
-                        return {"success": True, "video_url": data["video"]}
-                    req_id = data.get("request_id") or data.get("id")
-                    if req_id:
-                        return await _poll_video_result(client, req_id, model, req.hf_token)
-            except Exception:
-                pass
-
-        if resp.status_code in (201, 202):
-            try:
-                data = resp.json()
-                req_id = data.get("request_id") or data.get("id")
-                if req_id:
-                    return await _poll_video_result(client, req_id, model, req.hf_token)
-            except Exception:
-                pass
-
-        raise HTTPException(
-            status_code=resp.status_code,
-            detail=f"HF API Error: {resp.text[:500]}"
-        )
-
-
-async def _poll_video_result(client: httpx.AsyncClient, request_id: str, model: str, hf_token: str):
-    """Poll until Replicate job completes and return video URL or b64."""
     import base64
-    poll_url = f"https://router.huggingface.co/models/{model}/status/{request_id}"
-    headers = {
-        "Authorization": f"Bearer {hf_token}",
-        "x-provider": "replicate",
-    }
+    from concurrent.futures import ThreadPoolExecutor
+    from huggingface_hub import InferenceClient
 
-    for _ in range(40):  # ~4 min max
-        await asyncio.sleep(6)
-        try:
-            res = await client.get(poll_url, headers=headers, timeout=30)
-            if res.status_code == 200:
-                ct = res.headers.get("content-type", "")
-                if "video" in ct:
-                    return {
-                        "success": True,
-                        "video_b64": base64.b64encode(res.content).decode(),
-                        "content_type": "video/mp4",
-                    }
-                try:
-                    data = res.json()
-                    status = data.get("status", "")
-                    if status in ("COMPLETED", "succeeded"):
-                        url = (data.get("url") or
-                               (data.get("output") or {}).get("url") or
-                               data.get("video"))
-                        if url:
-                            return {"success": True, "video_url": url}
-                    if data.get("url"):
-                        return {"success": True, "video_url": data["url"]}
-                    if status in ("failed", "error"):
-                        raise HTTPException(status_code=500, detail="Video generation failed on provider")
-                except httpx.DecodingError:
-                    pass
-        except httpx.TimeoutException:
-            continue
+    # Fallback to Railway env var if Flutter didn't send a token
+    hf_token = req.hf_token or os.environ.get("HF_TOKEN", "")
+    if not hf_token:
+        raise HTTPException(status_code=500, detail="HF token missing. Admin Panel → API Keys → AI Video Creator → HuggingFace Token set karo.")
 
-    raise HTTPException(status_code=504, detail="Video generation timed out after 4 minutes")
+    full_prompt = (
+        f"{req.prompt}. "
+        "Cinematic, dramatic lighting, smooth camera motion, Instagram reel style, 5 seconds."
+    )
+
+    def _run_sync():
+        client = InferenceClient(
+            provider="replicate",
+            api_key=hf_token,
+        )
+        video_bytes = client.text_to_video(
+            full_prompt,
+            model="Wan-AI/Wan2.2-T2V-A14B",
+        )
+        return video_bytes
+
+    try:
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor() as pool:
+            video_bytes = await asyncio.wait_for(
+                loop.run_in_executor(pool, _run_sync),
+                timeout=300,
+            )
+
+        if not video_bytes:
+            raise HTTPException(status_code=500, detail="Video generation returned empty bytes")
+
+        return {
+            "success": True,
+            "video_b64": base64.b64encode(video_bytes).decode(),
+            "content_type": "video/mp4",
+        }
+
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Video generation timed out (5 min limit)")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Video Gen Failed: {str(e)}")
 
 
 if __name__ == "__main__":

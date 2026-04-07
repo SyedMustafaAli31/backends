@@ -8,3 +8,4 @@ pydantic==2.9.2
 lxml==5.3.0
 lxml_html_clean==0.3.1
 python-multipart==0.0.12
+huggingface_hub[inference]>=0.27.0
