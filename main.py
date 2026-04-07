@@ -73,6 +73,131 @@ def build_fallback_queries(
 
 
 # ══════════════════════════════════════════════════════════
+#  GOOGLE TRENDS — interest over time + rising queries
+# ══════════════════════════════════════════════════════════
+async def fetch_google_trends(
+    serpapi_key: str,
+    keyword: str,
+    geo: str = "IN",
+) -> str:
+    """
+    SerpAPI ke through Google Trends data fetch karta hai.
+    - Interest over time (last 3 months)
+    - Rising related queries (HOT right now)
+    - Top related queries
+    """
+    if not keyword or not serpapi_key:
+        return ""
+
+    buffer = []
+    # Use first keyword only (comma-sep not needed)
+    kw = keyword.split(",")[0].strip()[:100]
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        # ── 1. Interest over time ─────────────────────────
+        try:
+            resp = await client.get(
+                "https://serpapi.com/search",
+                params={
+                    "engine": "google_trends",
+                    "q": kw,
+                    "api_key": serpapi_key,
+                    "data_type": "TIMESERIES",
+                    "date": "today 3-m",
+                    "geo": geo,
+                },
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                timeline = data.get("interest_over_time", {}).get("timeline_data", [])
+                if timeline:
+                    values = []
+                    for point in timeline:
+                        for val in point.get("values", []):
+                            v = val.get("value")
+                            if v is not None:
+                                try:
+                                    values.append(int(v))
+                                except (ValueError, TypeError):
+                                    pass
+                    if values:
+                        avg = sum(values) / len(values)
+                        last = values[-1]
+                        direction = "Rising ↑" if last >= avg else "Declining ↓"
+                        buffer.append(f"GOOGLE TRENDS — '{kw}'")
+                        buffer.append(f"  Trend direction  : {direction}")
+                        buffer.append(f"  Interest (0-100) : peak={max(values)}, recent={last}, avg={int(avg)}")
+        except Exception as e:
+            print(f"[Trends TIMESERIES] {e}")
+
+        # ── 2. Rising + Top related queries ──────────────
+        try:
+            resp = await client.get(
+                "https://serpapi.com/search",
+                params={
+                    "engine": "google_trends",
+                    "q": kw,
+                    "api_key": serpapi_key,
+                    "data_type": "RELATED_QUERIES",
+                    "date": "today 3-m",
+                    "geo": geo,
+                },
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                related = data.get("related_queries", {})
+                rising = related.get("rising", [])
+                top    = related.get("top", [])
+
+                if rising:
+                    buffer.append("  Rising queries (🔥 trending NOW):")
+                    for q in rising[:8]:
+                        query = q.get("query", "")
+                        value = q.get("value", "")
+                        if query:
+                            buffer.append(f"    🔥 {query}  [{value}]")
+
+                if top:
+                    buffer.append("  Top searched queries:")
+                    for q in top[:6]:
+                        query = q.get("query", "")
+                        value = q.get("value", "")
+                        if query:
+                            buffer.append(f"    → {query}  [{value}]")
+        except Exception as e:
+            print(f"[Trends RELATED_QUERIES] {e}")
+
+        # ── 3. Related topics ──────────────────────────────
+        try:
+            resp = await client.get(
+                "https://serpapi.com/search",
+                params={
+                    "engine": "google_trends",
+                    "q": kw,
+                    "api_key": serpapi_key,
+                    "data_type": "RELATED_TOPICS",
+                    "date": "today 3-m",
+                    "geo": geo,
+                },
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                topics = data.get("related_topics", {})
+                rising_topics = topics.get("rising", [])
+                if rising_topics:
+                    buffer.append("  Rising topics (breakout areas):")
+                    for t in rising_topics[:5]:
+                        title_t = t.get("topic", {}).get("title", "")
+                        value   = t.get("value", "")
+                        if title_t:
+                            buffer.append(f"    ✦ {title_t}  [{value}]")
+        except Exception as e:
+            print(f"[Trends RELATED_TOPICS] {e}")
+
+    return "\n".join(buffer)
+
+
+# ══════════════════════════════════════════════════════════
 #  STEP 1: SerpAPI — real Google search results
 # ══════════════════════════════════════════════════════════
 async def fetch_serp_results(
@@ -353,7 +478,8 @@ async def _fetch_one_url(url: str) -> str:
 def build_research_summary(
     title: str, goal: str, niche: str, platforms: List[str],
     queries_used: List[str], serp_data: str,
-    url_content: str, sources: list[str]
+    url_content: str, sources: list[str],
+    trends_data: str = "",
 ) -> str:
     """
     Saara scraped data ko structured LLM-ready format mein organize karta hai.
@@ -371,6 +497,11 @@ def build_research_summary(
     lines.append(f"Platforms: {platform_str}")
     lines.append(f"Queries  : {len(queries_used)} searches performed")
     lines.append("")
+
+    if trends_data:
+        lines.append("─── GOOGLE TRENDS (LIVE) ───")
+        lines.append(trends_data)
+        lines.append("")
 
     if queries_used:
         lines.append("─── QUERIES SEARCHED ───")
@@ -395,8 +526,10 @@ def build_research_summary(
     lines.append("")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     lines.append("INSTRUCTION TO AI: The above is LIVE data from Google.")
-    lines.append("Use real titles, snippets, statistics, and insights from")
-    lines.append("this research. Do NOT fall back on generic knowledge.")
+    lines.append("1. Use GOOGLE TRENDS rising queries as post hooks and hashtag ideas.")
+    lines.append("2. Use RISING TOPICS to angle posts toward what audiences are searching NOW.")
+    lines.append("3. Use real titles, snippets, and statistics from search results.")
+    lines.append("4. Do NOT fall back on generic knowledge — use this real-time data.")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     return "\n".join(lines)
@@ -447,11 +580,12 @@ async def research(req: ResearchRequest):
             )
             print(f"[Research] Using {len(queries_to_use)} fallback-generated queries")
 
-        # Step 2: SerpAPI se real Google results
-        serp_data, urls = await fetch_serp_results(
-            serpapi_key=req.serpapi_key,
-            queries=queries_to_use,
-        )
+        # Step 2: SerpAPI + Google Trends parallel fetch
+        trends_keyword = niche if niche else req.title
+        serp_task   = fetch_serp_results(serpapi_key=req.serpapi_key, queries=queries_to_use)
+        trends_task = fetch_google_trends(serpapi_key=req.serpapi_key, keyword=trends_keyword)
+
+        (serp_data, urls), trends_data = await asyncio.gather(serp_task, trends_task)
 
         if not serp_data:
             return ResearchResponse(
@@ -475,6 +609,7 @@ async def research(req: ResearchRequest):
             serp_data=serp_data,
             url_content=url_content,
             sources=sources,
+            trends_data=trends_data,
         )
 
         return ResearchResponse(
@@ -499,6 +634,117 @@ async def scrape_url(req: ScrapeRequest):
     if not content:
         raise HTTPException(status_code=422, detail="Could not extract content from URL")
     return {"success": True, "content": content, "url": req.url}
+
+
+# ══════════════════════════════════════════════════════════════
+#  VIDEO GENERATION — HuggingFace → Replicate → Wan2.2
+#  Mirrors: InferenceClient(provider="replicate").text_to_video()
+# ══════════════════════════════════════════════════════════════
+class VideoGenerateRequest(BaseModel):
+    prompt: str
+    hf_token: str
+
+@app.post("/generate-video")
+async def generate_video(req: VideoGenerateRequest):
+    """
+    Generates a short video clip via HuggingFace router → Replicate → Wan2.2-T2V-A14B.
+    Returns base64-encoded mp4 video bytes.
+    """
+    model = "Wan-AI/Wan2.2-T2V-A14B"
+    full_prompt = f"{req.prompt}. Cinematic, dramatic lighting, smooth camera motion, Instagram reel style, 5 seconds."
+
+    headers = {
+        "Authorization": f"Bearer {req.hf_token}",
+        "Content-Type": "application/json",
+        "x-provider": "replicate",
+    }
+
+    async with httpx.AsyncClient(timeout=300) as client:
+        # Submit the generation job
+        resp = await client.post(
+            f"https://router.huggingface.co/models/{model}",
+            headers=headers,
+            json={"inputs": full_prompt},
+        )
+
+        if resp.status_code == 200:
+            ct = resp.headers.get("content-type", "")
+            if "video" in ct:
+                import base64
+                return {
+                    "success": True,
+                    "video_b64": base64.b64encode(resp.content).decode(),
+                    "content_type": "video/mp4",
+                }
+            # JSON response — may have url or request_id
+            try:
+                data = resp.json()
+                if isinstance(data, dict):
+                    if data.get("url"):
+                        return {"success": True, "video_url": data["url"]}
+                    if data.get("video"):
+                        return {"success": True, "video_url": data["video"]}
+                    req_id = data.get("request_id") or data.get("id")
+                    if req_id:
+                        return await _poll_video_result(client, req_id, model, req.hf_token)
+            except Exception:
+                pass
+
+        if resp.status_code in (201, 202):
+            try:
+                data = resp.json()
+                req_id = data.get("request_id") or data.get("id")
+                if req_id:
+                    return await _poll_video_result(client, req_id, model, req.hf_token)
+            except Exception:
+                pass
+
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"HF API Error: {resp.text[:500]}"
+        )
+
+
+async def _poll_video_result(client: httpx.AsyncClient, request_id: str, model: str, hf_token: str):
+    """Poll until Replicate job completes and return video URL or b64."""
+    import base64
+    poll_url = f"https://router.huggingface.co/models/{model}/status/{request_id}"
+    headers = {
+        "Authorization": f"Bearer {hf_token}",
+        "x-provider": "replicate",
+    }
+
+    for _ in range(40):  # ~4 min max
+        await asyncio.sleep(6)
+        try:
+            res = await client.get(poll_url, headers=headers, timeout=30)
+            if res.status_code == 200:
+                ct = res.headers.get("content-type", "")
+                if "video" in ct:
+                    return {
+                        "success": True,
+                        "video_b64": base64.b64encode(res.content).decode(),
+                        "content_type": "video/mp4",
+                    }
+                try:
+                    data = res.json()
+                    status = data.get("status", "")
+                    if status in ("COMPLETED", "succeeded"):
+                        url = (data.get("url") or
+                               (data.get("output") or {}).get("url") or
+                               data.get("video"))
+                        if url:
+                            return {"success": True, "video_url": url}
+                    if data.get("url"):
+                        return {"success": True, "video_url": data["url"]}
+                    if status in ("failed", "error"):
+                        raise HTTPException(status_code=500, detail="Video generation failed on provider")
+                except httpx.DecodingError:
+                    pass
+        except httpx.TimeoutException:
+            continue
+
+    raise HTTPException(status_code=504, detail="Video generation timed out after 4 minutes")
 
 
 if __name__ == "__main__":
