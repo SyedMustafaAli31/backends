@@ -539,6 +539,16 @@ def build_research_summary(
 #  API ENDPOINTS
 # ══════════════════════════════════════════════════════════
 
+@app.get("/")
+async def root():
+    """Root route — Railway health check default path."""
+    return {
+        "status": "ok",
+        "service": "SocialFlux AI Research Backend",
+        "version": "3.0.0",
+    }
+
+
 @app.get("/health")
 async def health():
     return {
