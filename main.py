@@ -13,6 +13,19 @@ from bs4 import BeautifulSoup
 
 app = FastAPI(title="Social Media Research API", version="3.0.0")
 
+# Normalize double-slash paths (e.g. //health → /health)
+# Railway health-check sometimes sends GET //health due to URL construction
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+
+class NormalizePathMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: StarletteRequest, call_next):
+        if '//' in request.url.path:
+            request.scope['path'] = '/' + request.url.path.lstrip('/')
+        return await call_next(request)
+
+app.add_middleware(NormalizePathMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
