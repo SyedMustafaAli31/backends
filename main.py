@@ -729,160 +729,208 @@ async def _call_ai_api(url: str, prompt: str, headers: dict) -> str:
 #  COMPETITOR DISCOVERY — Location + Keywords + SerpAPI
 # ══════════════════════════════════════════════════════════════
 class CompetitorRequest(BaseModel):
-    location: str           # "Banjara Hills, Hyderabad"
-    keywords: List[str]     # max 5 selected by user
-    radius_km: float = 10   # 2 / 5 / 10 / custom / 0 = worldwide
+    location: str                    # "Banjara Hills, Hyderabad"
+    keywords: List[str]              # up to 5 selected by user
+    radius_km: float = 10            # 2/5/10/25/50/custom, 0 = worldwide
+    lat_lng: Optional[str] = ""      # "17.385044,78.486671" GPS from device
     serpapi_key: str
     ai_api_key: str
     ai_provider: str = "gemini"
-    max_competitors: int = 8
+    max_competitors: int = 10
 
-class CompetitorInfo(BaseModel):
-    name: str
-    address: Optional[str] = ""
-    distance: Optional[str] = ""
-    rating: Optional[float] = None
-    reviews: Optional[int] = None
-    website: Optional[str] = ""
-    phone: Optional[str] = ""
-    place_id: Optional[str] = ""
-    thumbnail: Optional[str] = ""
-    gps_coords: Optional[dict] = None
-    social_links: Optional[dict] = None
-    scraped_content: Optional[str] = ""
-    ai_analysis: Optional[dict] = None
+
+def _radius_to_zoom(radius_km: float) -> int:
+    """Convert search radius to Google Maps zoom level."""
+    if radius_km <= 0:   return 6   # worldwide
+    if radius_km <= 2:   return 15
+    if radius_km <= 5:   return 13
+    if radius_km <= 10:  return 12
+    if radius_km <= 25:  return 11
+    if radius_km <= 50:  return 10
+    if radius_km <= 100: return 9
+    return 7
+
+
+def _parse_reviews(val) -> Optional[int]:
+    """Parse reviews field — can be int, float, or string like '1,234'."""
+    if val is None:
+        return None
+    try:
+        return int(str(val).replace(",", "").replace(".", "").strip())
+    except Exception:
+        return None
+
+
+def _parse_distance_km(dist_str: str) -> Optional[float]:
+    """Parse distance string like '2.3 km' or '1.4 mi' → km float."""
+    if not dist_str:
+        return None
+    try:
+        num = float(re.sub(r"[^\d.]", "", dist_str.split()[0]))
+        if "mi" in dist_str.lower():
+            return round(num * 1.609, 2)
+        return round(num, 2)
+    except Exception:
+        return None
+
+
+async def _maps_search(
+    client: httpx.AsyncClient,
+    api_key: str,
+    query: str,
+    lat_lng: str,
+    location: str,
+    radius_km: float,
+) -> list:
+    """Single SerpAPI google_maps search. Returns list of place dicts."""
+    zoom = _radius_to_zoom(radius_km)
+    params: dict = {
+        "engine": "google_maps",
+        "q": query,
+        "api_key": api_key,
+        "type": "search",
+        "hl": "en",
+    }
+    if lat_lng:
+        # Anchor map at exact GPS position with radius-based zoom
+        params["ll"] = f"@{lat_lng},{zoom}z"
+    else:
+        # Use city/location name — extract just the city part for accuracy
+        city = location.split(",")[0].strip() if "," in location else location
+        params["location"] = location  # full address for better geocoding
+        params["q"] = f"{query} near {city}"
+
+    try:
+        r = await client.get("https://serpapi.com/search", params=params, timeout=25)
+        if r.status_code != 200:
+            print(f"[Maps] HTTP {r.status_code} for query={query!r}")
+            return []
+        data = r.json()
+        return data.get("local_results") or []
+    except Exception as e:
+        print(f"[Maps] Error for query={query!r}: {e}")
+        return []
+
 
 @app.post("/competitors")
 async def find_competitors(req: CompetitorRequest):
     """
-    Location + keywords se local competitors dhundhta hai.
-    Uses SerpAPI Google Maps + website scraping + AI analysis.
+    Location + keywords se real local competitors dhundhta hai.
+    - Each keyword searched separately on Google Maps for best results
+    - GPS coordinates used when available for precise radius
+    - AI analysis runs on every found competitor
     """
     competitors = []
-    seen_names = set()
+    seen_names: set = set()
 
-    # Build search queries from keywords
-    primary_kw = " ".join(req.keywords[:3])
-    queries = [
-        f"{primary_kw} near {req.location}",
-        f"best {primary_kw} in {req.location}",
-        f"{req.keywords[0]} {req.location}" if req.keywords else req.location,
-    ]
-    if req.radius_km == 0:  # worldwide
-        queries = [f"top {primary_kw} businesses", f"best {primary_kw} worldwide"]
+    def add_place(place: dict):
+        name = (place.get("title") or place.get("name") or "").strip()
+        if not name or name.lower() in seen_names:
+            return
+        seen_names.add(name.lower())
 
-    # Search via SerpAPI Google Maps
+        links = place.get("links") or {}
+        website = (
+            links.get("website") or
+            place.get("website") or ""
+        )
+        dist_str = place.get("distance") or ""
+        dist_km = _parse_distance_km(dist_str)
+
+        # Filter strictly by radius when we have distance data
+        if req.radius_km > 0 and dist_km is not None:
+            if dist_km > req.radius_km * 1.3:   # 30% buffer for road distance
+                return
+
+        thumbnail = place.get("thumbnail") or ""
+        if not thumbnail and place.get("photos"):
+            thumbnail = place["photos"][0].get("thumbnail", "")
+
+        competitors.append({
+            "name": name,
+            "address": place.get("address") or "",
+            "distance": dist_str,
+            "distance_km": dist_km,
+            "rating": place.get("rating"),
+            "reviews": _parse_reviews(place.get("reviews")),
+            "website": website,
+            "phone": place.get("phone") or "",
+            "place_id": place.get("place_id") or "",
+            "thumbnail": thumbnail,
+            "gps_coords": place.get("gps_coordinates"),
+            "category": place.get("type") or (
+                place["types"][0] if place.get("types") else ""
+            ),
+            "social_links": {},
+            "scraped_content": "",
+            "ai_analysis": None,
+        })
+
+    # ── Search each keyword individually on Google Maps ──────
+    # Searching keywords joined together produces poor Maps results.
+    # Individual searches give far more accurate local business hits.
+    search_kws = req.keywords[:5] if req.keywords else [req.location]
+
     async with httpx.AsyncClient(timeout=30) as client:
-        for query in queries[:2]:
+        for kw in search_kws:
             if len(competitors) >= req.max_competitors:
                 break
+            places = await _maps_search(
+                client=client,
+                api_key=req.serpapi_key,
+                query=kw,
+                lat_lng=req.lat_lng or "",
+                location=req.location,
+                radius_km=req.radius_km,
+            )
+            for p in places:
+                if len(competitors) >= req.max_competitors:
+                    break
+                add_place(p)
+            print(f"[Competitors] kw={kw!r} → {len(places)} places, total so far={len(competitors)}")
+
+        # ── Fallback: Google organic local pack ──────────────
+        if len(competitors) < 4 and search_kws:
             try:
-                params = {
-                    "engine": "google_maps",
-                    "q": query,
-                    "api_key": req.serpapi_key,
-                    "type": "search",
-                    "num": "10",
-                }
-                if req.radius_km > 0:
-                    # Add radius hint in query
-                    params["q"] = f"{query} within {int(req.radius_km)}km"
-
-                r = await client.get("https://serpapi.com/search", params=params)
-                data = r.json()
-
-                places = data.get("local_results", []) or data.get("places", [])
-                for place in places:
-                    name = place.get("title", "") or place.get("name", "")
-                    if not name or name.lower() in seen_names:
-                        continue
-                    seen_names.add(name.lower())
-
-                    dist_raw = place.get("distance", "")
-                    website = place.get("website", "") or place.get("links", {}).get("website", "")
-
-                    comp = {
-                        "name": name,
-                        "address": place.get("address", ""),
-                        "distance": dist_raw,
-                        "rating": place.get("rating"),
-                        "reviews": place.get("reviews", 0),
-                        "website": website,
-                        "phone": place.get("phone", ""),
-                        "place_id": place.get("place_id", ""),
-                        "thumbnail": place.get("thumbnail", "") or place.get("photos", [{}])[0].get("thumbnail", "") if place.get("photos") else "",
-                        "gps_coords": place.get("gps_coordinates"),
-                        "social_links": {},
-                        "scraped_content": "",
-                        "ai_analysis": None,
-                    }
-
-                    # Filter by radius (if SerpAPI gives distance)
-                    if req.radius_km > 0 and dist_raw:
-                        try:
-                            dist_val = float(re.sub(r"[^\d.]", "", dist_raw.split()[0]))
-                            is_miles = "mi" in dist_raw.lower()
-                            dist_km = dist_val * 1.609 if is_miles else dist_val
-                            if dist_km > req.radius_km * 1.5:  # 1.5x buffer
-                                continue
-                        except Exception:
-                            pass
-
-                    competitors.append(comp)
-                    if len(competitors) >= req.max_competitors:
-                        break
-
-            except Exception as e:
-                continue
-
-    # Also search SerpAPI organic for competitor websites
-    if len(competitors) < 3:
-        try:
-            async with httpx.AsyncClient(timeout=20) as client:
+                city = req.location.split(",")[0].strip()
                 r = await client.get("https://serpapi.com/search", params={
                     "engine": "google",
-                    "q": f"top {primary_kw} {req.location} competitors",
+                    "q": f"{search_kws[0]} near {city}",
                     "api_key": req.serpapi_key,
-                    "num": "5",
-                })
-                data = r.json()
-                for result in data.get("organic_results", [])[:5]:
-                    name = result.get("title", "").split(" - ")[0].split("|")[0].strip()
-                    if name and name.lower() not in seen_names and len(name) < 60:
-                        seen_names.add(name.lower())
-                        competitors.append({
-                            "name": name,
-                            "address": "",
-                            "distance": "",
-                            "rating": None,
-                            "reviews": 0,
-                            "website": result.get("link", ""),
-                            "phone": "",
-                            "place_id": "",
-                            "thumbnail": result.get("thumbnail", ""),
-                            "gps_coords": None,
-                            "social_links": {},
-                            "scraped_content": "",
-                            "ai_analysis": None,
-                        })
-        except Exception:
-            pass
+                    "hl": "en",
+                    "num": "10",
+                }, timeout=20)
+                if r.status_code == 200:
+                    data = r.json()
+                    # Local pack results
+                    for p in (data.get("local_results") or []):
+                        if len(competitors) >= req.max_competitors:
+                            break
+                        add_place(p)
+                    print(f"[Competitors] Google organic fallback → {len(competitors)} total")
+            except Exception as e:
+                print(f"[Competitors] Fallback error: {e}")
 
-    # Scrape websites + run AI analysis in parallel
-    scrape_tasks = []
-    for comp in competitors[:req.max_competitors]:
-        if comp.get("website"):
-            scrape_tasks.append(_enrich_competitor(comp, req))
-        else:
-            scrape_tasks.append(_analyze_competitor_no_web(comp, req))
+    if not competitors:
+        return {
+            "success": False,
+            "location": req.location,
+            "radius_km": req.radius_km,
+            "total": 0,
+            "competitors": [],
+            "error": "No competitors found. Try different keywords or a larger radius."
+        }
 
+    # ── AI analysis for each competitor (parallel) ───────────
+    scrape_tasks = [
+        _enrich_competitor(c, req) if c.get("website") else _analyze_competitor_no_web(c, req)
+        for c in competitors[:req.max_competitors]
+    ]
     enriched = await asyncio.gather(*scrape_tasks, return_exceptions=True)
-    final = []
-    for i, result in enumerate(enriched):
-        if isinstance(result, Exception):
-            final.append(competitors[i] if i < len(competitors) else {})
-        else:
-            final.append(result)
+    final = [
+        enriched[i] if not isinstance(enriched[i], Exception) else competitors[i]
+        for i in range(len(enriched))
+    ]
 
     return {
         "success": True,
@@ -933,50 +981,65 @@ async def _analyze_competitor_no_web(comp: dict, req: CompetitorRequest) -> dict
 
 
 async def _ai_analyze_competitor(comp: dict, req: CompetitorRequest) -> dict:
-    """Generate AI analysis for a competitor."""
+    """Generate AI analysis for a competitor.
+    Uses req.ai_api_key if provided, else falls back to GEMINI_API_KEY env var.
+    """
     scraped = comp.get("scraped_content", "")
-    website_section = f"\nWebsite Content (first 2000 chars):\n{scraped[:2000]}" if scraped else ""
+    website_section = f"\nWebsite Content:\n{scraped[:2000]}" if scraped else ""
 
-    prompt = f"""You are an expert social media marketing analyst. Analyze this competitor for a business campaign.
+    rating_str = f"{comp.get('rating', 'N/A')} ★ ({comp.get('reviews', 0)} reviews)"
+    dist_str = f"  Distance: {comp.get('distance_km')} km" if comp.get("distance_km") else ""
+    addr_str = comp.get("address") or req.location
 
-COMPETITOR INFO:
+    prompt = f"""You are an expert social media marketing analyst. Analyze this REAL local competitor.
+
+COMPETITOR (real Google Maps data):
 Name: {comp.get('name', 'Unknown')}
-Location: {comp.get('address', req.location)}
-Rating: {comp.get('rating', 'N/A')} ({comp.get('reviews', 0)} reviews)
-Keywords/Niche: {', '.join(req.keywords)}{website_section}
+Address: {addr_str}{dist_str}
+Rating: {rating_str}
+Category: {comp.get('category', '')}
+Phone: {comp.get('phone', 'N/A')}
+Website: {comp.get('website', 'N/A')}
+Search Keywords: {', '.join(req.keywords)}{website_section}
 
-Generate a detailed competitor analysis. Return ONLY this JSON:
+Based on this REAL data, generate a detailed competitor analysis.
+Use the rating/reviews to derive strength_score (higher rating + more reviews = higher score).
+Return ONLY this JSON (no markdown, no explanation):
 {{
-  "strength_score": <0-100 integer>,
+  "strength_score": <0-100 integer based on real rating and reviews>,
   "threat_level": "High" | "Medium" | "Low",
-  "best_content": ["insight 1", "insight 2", "insight 3"],
+  "best_content": ["content insight 1", "content insight 2", "content insight 3"],
   "hook_style": ["hook style 1", "hook style 2"],
-  "posting_pattern": "description of likely posting frequency and timing",
+  "posting_pattern": "likely posting frequency and content mix",
   "offer_types": ["offer 1", "offer 2"],
-  "visual_style": "description of their likely visual branding",
+  "visual_style": "their likely visual branding style",
   "weaknesses": ["weakness 1", "weakness 2", "weakness 3"],
-  "opportunities": ["opportunity 1", "opportunity 2", "opportunity 3"],
-  "summary": "one line summary of this competitor"
+  "opportunities": ["opportunity for you 1", "opportunity 2", "opportunity 3"],
+  "summary": "one line summary of this competitor and their main threat"
 }}"""
+
+    # Resolve AI key: use passed key, fallback to env var (Railway variable)
+    ai_key = req.ai_api_key or os.environ.get("GEMINI_API_KEY", "")
+    provider = req.ai_provider if req.ai_api_key else "gemini"
 
     try:
         raw = ""
-        if req.ai_provider == "gemini":
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={req.ai_api_key}"
+        if provider == "gemini" and ai_key:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={ai_key}"
             raw = await _call_ai_api(url, prompt, {})
-        elif req.ai_provider == "groq":
+        elif provider == "groq" and ai_key:
             async with httpx.AsyncClient(timeout=25) as client:
                 r = await client.post(
                     "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {req.ai_api_key}", "Content-Type": "application/json"},
+                    headers={"Authorization": f"Bearer {ai_key}", "Content-Type": "application/json"},
                     json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}], "max_tokens": 800}
                 )
                 raw = r.json()["choices"][0]["message"]["content"]
-        elif req.ai_provider == "openai":
+        elif provider == "openai" and ai_key:
             async with httpx.AsyncClient(timeout=25) as client:
                 r = await client.post(
                     "https://api.openai.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {req.ai_api_key}", "Content-Type": "application/json"},
+                    headers={"Authorization": f"Bearer {ai_key}", "Content-Type": "application/json"},
                     json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "max_tokens": 800}
                 )
                 raw = r.json()["choices"][0]["message"]["content"]
