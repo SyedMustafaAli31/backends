@@ -13,19 +13,6 @@ from bs4 import BeautifulSoup
 
 app = FastAPI(title="Social Media Research API", version="3.0.0")
 
-# Normalize double-slash paths (e.g. //health → /health)
-# Railway health-check sometimes sends GET //health due to URL construction
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request as StarletteRequest
-
-class NormalizePathMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: StarletteRequest, call_next):
-        if '//' in request.url.path:
-            request.scope['path'] = '/' + request.url.path.lstrip('/')
-        return await call_next(request)
-
-app.add_middleware(NormalizePathMiddleware)
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -83,131 +70,6 @@ def build_fallback_queries(
     ]
 
     return all_queries[:max_queries]
-
-
-# ══════════════════════════════════════════════════════════
-#  GOOGLE TRENDS — interest over time + rising queries
-# ══════════════════════════════════════════════════════════
-async def fetch_google_trends(
-    serpapi_key: str,
-    keyword: str,
-    geo: str = "IN",
-) -> str:
-    """
-    SerpAPI ke through Google Trends data fetch karta hai.
-    - Interest over time (last 3 months)
-    - Rising related queries (HOT right now)
-    - Top related queries
-    """
-    if not keyword or not serpapi_key:
-        return ""
-
-    buffer = []
-    # Use first keyword only (comma-sep not needed)
-    kw = keyword.split(",")[0].strip()[:100]
-
-    async with httpx.AsyncClient(timeout=20) as client:
-        # ── 1. Interest over time ─────────────────────────
-        try:
-            resp = await client.get(
-                "https://serpapi.com/search",
-                params={
-                    "engine": "google_trends",
-                    "q": kw,
-                    "api_key": serpapi_key,
-                    "data_type": "TIMESERIES",
-                    "date": "today 3-m",
-                    "geo": geo,
-                },
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                timeline = data.get("interest_over_time", {}).get("timeline_data", [])
-                if timeline:
-                    values = []
-                    for point in timeline:
-                        for val in point.get("values", []):
-                            v = val.get("value")
-                            if v is not None:
-                                try:
-                                    values.append(int(v))
-                                except (ValueError, TypeError):
-                                    pass
-                    if values:
-                        avg = sum(values) / len(values)
-                        last = values[-1]
-                        direction = "Rising ↑" if last >= avg else "Declining ↓"
-                        buffer.append(f"GOOGLE TRENDS — '{kw}'")
-                        buffer.append(f"  Trend direction  : {direction}")
-                        buffer.append(f"  Interest (0-100) : peak={max(values)}, recent={last}, avg={int(avg)}")
-        except Exception as e:
-            print(f"[Trends TIMESERIES] {e}")
-
-        # ── 2. Rising + Top related queries ──────────────
-        try:
-            resp = await client.get(
-                "https://serpapi.com/search",
-                params={
-                    "engine": "google_trends",
-                    "q": kw,
-                    "api_key": serpapi_key,
-                    "data_type": "RELATED_QUERIES",
-                    "date": "today 3-m",
-                    "geo": geo,
-                },
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                related = data.get("related_queries", {})
-                rising = related.get("rising", [])
-                top    = related.get("top", [])
-
-                if rising:
-                    buffer.append("  Rising queries (🔥 trending NOW):")
-                    for q in rising[:8]:
-                        query = q.get("query", "")
-                        value = q.get("value", "")
-                        if query:
-                            buffer.append(f"    🔥 {query}  [{value}]")
-
-                if top:
-                    buffer.append("  Top searched queries:")
-                    for q in top[:6]:
-                        query = q.get("query", "")
-                        value = q.get("value", "")
-                        if query:
-                            buffer.append(f"    → {query}  [{value}]")
-        except Exception as e:
-            print(f"[Trends RELATED_QUERIES] {e}")
-
-        # ── 3. Related topics ──────────────────────────────
-        try:
-            resp = await client.get(
-                "https://serpapi.com/search",
-                params={
-                    "engine": "google_trends",
-                    "q": kw,
-                    "api_key": serpapi_key,
-                    "data_type": "RELATED_TOPICS",
-                    "date": "today 3-m",
-                    "geo": geo,
-                },
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                topics = data.get("related_topics", {})
-                rising_topics = topics.get("rising", [])
-                if rising_topics:
-                    buffer.append("  Rising topics (breakout areas):")
-                    for t in rising_topics[:5]:
-                        title_t = t.get("topic", {}).get("title", "")
-                        value   = t.get("value", "")
-                        if title_t:
-                            buffer.append(f"    ✦ {title_t}  [{value}]")
-        except Exception as e:
-            print(f"[Trends RELATED_TOPICS] {e}")
-
-    return "\n".join(buffer)
 
 
 # ══════════════════════════════════════════════════════════
@@ -491,8 +353,7 @@ async def _fetch_one_url(url: str) -> str:
 def build_research_summary(
     title: str, goal: str, niche: str, platforms: List[str],
     queries_used: List[str], serp_data: str,
-    url_content: str, sources: list[str],
-    trends_data: str = "",
+    url_content: str, sources: list[str]
 ) -> str:
     """
     Saara scraped data ko structured LLM-ready format mein organize karta hai.
@@ -510,11 +371,6 @@ def build_research_summary(
     lines.append(f"Platforms: {platform_str}")
     lines.append(f"Queries  : {len(queries_used)} searches performed")
     lines.append("")
-
-    if trends_data:
-        lines.append("─── GOOGLE TRENDS (LIVE) ───")
-        lines.append(trends_data)
-        lines.append("")
 
     if queries_used:
         lines.append("─── QUERIES SEARCHED ───")
@@ -539,10 +395,8 @@ def build_research_summary(
     lines.append("")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     lines.append("INSTRUCTION TO AI: The above is LIVE data from Google.")
-    lines.append("1. Use GOOGLE TRENDS rising queries as post hooks and hashtag ideas.")
-    lines.append("2. Use RISING TOPICS to angle posts toward what audiences are searching NOW.")
-    lines.append("3. Use real titles, snippets, and statistics from search results.")
-    lines.append("4. Do NOT fall back on generic knowledge — use this real-time data.")
+    lines.append("Use real titles, snippets, statistics, and insights from")
+    lines.append("this research. Do NOT fall back on generic knowledge.")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     return "\n".join(lines)
@@ -551,16 +405,6 @@ def build_research_summary(
 # ══════════════════════════════════════════════════════════
 #  API ENDPOINTS
 # ══════════════════════════════════════════════════════════
-
-@app.get("/")
-async def root():
-    """Root route — Railway health check default path."""
-    return {
-        "status": "ok",
-        "service": "SocialFlux AI Research Backend",
-        "version": "3.0.0",
-    }
-
 
 @app.get("/health")
 async def health():
@@ -603,12 +447,11 @@ async def research(req: ResearchRequest):
             )
             print(f"[Research] Using {len(queries_to_use)} fallback-generated queries")
 
-        # Step 2: SerpAPI + Google Trends parallel fetch
-        trends_keyword = niche if niche else req.title
-        serp_task   = fetch_serp_results(serpapi_key=req.serpapi_key, queries=queries_to_use)
-        trends_task = fetch_google_trends(serpapi_key=req.serpapi_key, keyword=trends_keyword)
-
-        (serp_data, urls), trends_data = await asyncio.gather(serp_task, trends_task)
+        # Step 2: SerpAPI se real Google results
+        serp_data, urls = await fetch_serp_results(
+            serpapi_key=req.serpapi_key,
+            queries=queries_to_use,
+        )
 
         if not serp_data:
             return ResearchResponse(
@@ -632,7 +475,6 @@ async def research(req: ResearchRequest):
             serp_data=serp_data,
             url_content=url_content,
             sources=sources,
-            trends_data=trends_data,
         )
 
         return ResearchResponse(
@@ -646,427 +488,6 @@ async def research(req: ResearchRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ══════════════════════════════════════════════════════════════
-#  KEYWORD SUGGESTIONS — LLM se title ke basis pe keywords
-# ══════════════════════════════════════════════════════════════
-class KeywordRequest(BaseModel):
-    title: str
-    niche: Optional[str] = ""
-    location: Optional[str] = ""
-    ai_api_key: str
-    ai_provider: str = "gemini"  # gemini / groq / openai
-
-@app.post("/keyword-suggestions")
-async def keyword_suggestions(req: KeywordRequest):
-    """Campaign title ke basis pe 12-15 relevant keywords suggest karta hai."""
-    prompt = f"""You are a local marketing expert. A business owner wants to create a social media campaign.
-
-Campaign Title: "{req.title}"
-Business Niche: "{req.niche or 'General Business'}"
-Location: "{req.location or 'India'}"
-
-Generate 12-15 highly relevant keywords for competitor research and local SEO.
-These keywords will be used to find local competitors and trending content.
-
-Rules:
-- Include location-specific terms if location is provided
-- Mix broad + niche + local keywords
-- Include both English and common local language terms if applicable
-- Focus on what customers would search for
-- Include competitor-finding keywords (e.g., "best biryani near me")
-
-Return ONLY a JSON array of keyword strings, no explanation:
-["keyword1", "keyword2", ...]"""
-
-    headers = {"Content-Type": "application/json"}
-    try:
-        raw = ""
-        if req.ai_provider == "gemini":
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={req.ai_api_key}"
-            resp = await _call_ai_api(url, prompt, headers={})
-            raw = resp
-        elif req.ai_provider == "groq":
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {req.ai_api_key}", "Content-Type": "application/json"},
-                    json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}], "max_tokens": 500}
-                )
-                raw = r.json()["choices"][0]["message"]["content"]
-        elif req.ai_provider == "openai":
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {req.ai_api_key}", "Content-Type": "application/json"},
-                    json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "max_tokens": 500}
-                )
-                raw = r.json()["choices"][0]["message"]["content"]
-
-        # Parse JSON array from response
-        cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
-        start = cleaned.find("[")
-        end = cleaned.rfind("]") + 1
-        if start >= 0 and end > start:
-            keywords = json.loads(cleaned[start:end])
-            return {"success": True, "keywords": keywords[:15]}
-        return {"success": False, "keywords": [], "error": "Could not parse keywords"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-async def _call_ai_api(url: str, prompt: str, headers: dict) -> str:
-    """Call Gemini API and return text response."""
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(url, json={
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"maxOutputTokens": 1000, "temperature": 0.7}
-        })
-        data = r.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
-
-
-# ══════════════════════════════════════════════════════════════
-#  COMPETITOR DISCOVERY — Location + Keywords + SerpAPI
-# ══════════════════════════════════════════════════════════════
-class CompetitorRequest(BaseModel):
-    location: str                    # "Banjara Hills, Hyderabad"
-    keywords: List[str]              # up to 5 selected by user
-    radius_km: float = 10            # 2/5/10/25/50/custom, 0 = worldwide
-    lat_lng: Optional[str] = ""      # "17.385044,78.486671" GPS from device
-    serpapi_key: str
-    ai_api_key: str
-    ai_provider: str = "gemini"
-    max_competitors: int = 10
-
-
-def _radius_to_zoom(radius_km: float) -> int:
-    """Convert search radius to Google Maps zoom level."""
-    if radius_km <= 0:   return 6   # worldwide
-    if radius_km <= 2:   return 15
-    if radius_km <= 5:   return 13
-    if radius_km <= 10:  return 12
-    if radius_km <= 25:  return 11
-    if radius_km <= 50:  return 10
-    if radius_km <= 100: return 9
-    return 7
-
-
-def _parse_reviews(val) -> Optional[int]:
-    """Parse reviews field — can be int, float, or string like '1,234'."""
-    if val is None:
-        return None
-    try:
-        return int(str(val).replace(",", "").replace(".", "").strip())
-    except Exception:
-        return None
-
-
-def _parse_distance_km(dist_str: str) -> Optional[float]:
-    """Parse distance string like '2.3 km' or '1.4 mi' → km float."""
-    if not dist_str:
-        return None
-    try:
-        num = float(re.sub(r"[^\d.]", "", dist_str.split()[0]))
-        if "mi" in dist_str.lower():
-            return round(num * 1.609, 2)
-        return round(num, 2)
-    except Exception:
-        return None
-
-
-async def _maps_search(
-    client: httpx.AsyncClient,
-    api_key: str,
-    query: str,
-    lat_lng: str,
-    location: str,
-    radius_km: float,
-) -> list:
-    """Single SerpAPI google_maps search. Returns list of place dicts."""
-    zoom = _radius_to_zoom(radius_km)
-    params: dict = {
-        "engine": "google_maps",
-        "q": query,
-        "api_key": api_key,
-        "type": "search",
-        "hl": "en",
-    }
-    if lat_lng:
-        # Anchor map at exact GPS position with radius-based zoom
-        params["ll"] = f"@{lat_lng},{zoom}z"
-    else:
-        # Use city/location name — extract just the city part for accuracy
-        city = location.split(",")[0].strip() if "," in location else location
-        params["location"] = location  # full address for better geocoding
-        params["q"] = f"{query} near {city}"
-
-    try:
-        r = await client.get("https://serpapi.com/search", params=params, timeout=25)
-        if r.status_code != 200:
-            print(f"[Maps] HTTP {r.status_code} for query={query!r}")
-            return []
-        data = r.json()
-        return data.get("local_results") or []
-    except Exception as e:
-        print(f"[Maps] Error for query={query!r}: {e}")
-        return []
-
-
-@app.post("/competitors")
-async def find_competitors(req: CompetitorRequest):
-    """
-    Location + keywords se real local competitors dhundhta hai.
-    - Each keyword searched separately on Google Maps for best results
-    - GPS coordinates used when available for precise radius
-    - AI analysis runs on every found competitor
-    """
-    competitors = []
-    seen_names: set = set()
-
-    def add_place(place: dict):
-        name = (place.get("title") or place.get("name") or "").strip()
-        if not name or name.lower() in seen_names:
-            return
-        seen_names.add(name.lower())
-
-        links = place.get("links") or {}
-        website = (
-            links.get("website") or
-            place.get("website") or ""
-        )
-        dist_str = place.get("distance") or ""
-        dist_km = _parse_distance_km(dist_str)
-
-        # Filter strictly by radius when we have distance data
-        if req.radius_km > 0 and dist_km is not None:
-            if dist_km > req.radius_km * 1.3:   # 30% buffer for road distance
-                return
-
-        thumbnail = place.get("thumbnail") or ""
-        if not thumbnail and place.get("photos"):
-            thumbnail = place["photos"][0].get("thumbnail", "")
-
-        competitors.append({
-            "name": name,
-            "address": place.get("address") or "",
-            "distance": dist_str,
-            "distance_km": dist_km,
-            "rating": place.get("rating"),
-            "reviews": _parse_reviews(place.get("reviews")),
-            "website": website,
-            "phone": place.get("phone") or "",
-            "place_id": place.get("place_id") or "",
-            "thumbnail": thumbnail,
-            "gps_coords": place.get("gps_coordinates"),
-            "category": place.get("type") or (
-                place["types"][0] if place.get("types") else ""
-            ),
-            "social_links": {},
-            "scraped_content": "",
-            "ai_analysis": None,
-        })
-
-    # ── Search each keyword individually on Google Maps ──────
-    # Searching keywords joined together produces poor Maps results.
-    # Individual searches give far more accurate local business hits.
-    search_kws = req.keywords[:5] if req.keywords else [req.location]
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        for kw in search_kws:
-            if len(competitors) >= req.max_competitors:
-                break
-            places = await _maps_search(
-                client=client,
-                api_key=req.serpapi_key,
-                query=kw,
-                lat_lng=req.lat_lng or "",
-                location=req.location,
-                radius_km=req.radius_km,
-            )
-            for p in places:
-                if len(competitors) >= req.max_competitors:
-                    break
-                add_place(p)
-            print(f"[Competitors] kw={kw!r} → {len(places)} places, total so far={len(competitors)}")
-
-        # ── Fallback: Google organic local pack ──────────────
-        if len(competitors) < 4 and search_kws:
-            try:
-                city = req.location.split(",")[0].strip()
-                r = await client.get("https://serpapi.com/search", params={
-                    "engine": "google",
-                    "q": f"{search_kws[0]} near {city}",
-                    "api_key": req.serpapi_key,
-                    "hl": "en",
-                    "num": "10",
-                }, timeout=20)
-                if r.status_code == 200:
-                    data = r.json()
-                    # Local pack results
-                    for p in (data.get("local_results") or []):
-                        if len(competitors) >= req.max_competitors:
-                            break
-                        add_place(p)
-                    print(f"[Competitors] Google organic fallback → {len(competitors)} total")
-            except Exception as e:
-                print(f"[Competitors] Fallback error: {e}")
-
-    if not competitors:
-        return {
-            "success": False,
-            "location": req.location,
-            "radius_km": req.radius_km,
-            "total": 0,
-            "competitors": [],
-            "error": "No competitors found. Try different keywords or a larger radius."
-        }
-
-    # ── AI analysis for each competitor (parallel) ───────────
-    scrape_tasks = [
-        _enrich_competitor(c, req) if c.get("website") else _analyze_competitor_no_web(c, req)
-        for c in competitors[:req.max_competitors]
-    ]
-    enriched = await asyncio.gather(*scrape_tasks, return_exceptions=True)
-    final = [
-        enriched[i] if not isinstance(enriched[i], Exception) else competitors[i]
-        for i in range(len(enriched))
-    ]
-
-    return {
-        "success": True,
-        "location": req.location,
-        "radius_km": req.radius_km,
-        "total": len(final),
-        "competitors": final,
-    }
-
-
-async def _enrich_competitor(comp: dict, req: CompetitorRequest) -> dict:
-    """Scrape website + social links + run AI analysis."""
-    website = comp.get("website", "")
-    scraped = ""
-    social_links = {}
-
-    if website:
-        try:
-            content = await _fetch_one_url(website)
-            if content:
-                scraped = content[:3000]
-                # Try to find social links
-                async with httpx.AsyncClient(timeout=10) as client:
-                    r = await client.get(website, headers={"User-Agent": "Mozilla/5.0"}, timeout=8, follow_redirects=True)
-                    html = r.text
-                    for pattern, key in [
-                        (r'instagram\.com/([A-Za-z0-9_.]+)', 'instagram'),
-                        (r'facebook\.com/([A-Za-z0-9_.]+)', 'facebook'),
-                        (r'twitter\.com/([A-Za-z0-9_]+)', 'twitter'),
-                        (r'youtube\.com/(@?[A-Za-z0-9_-]+)', 'youtube'),
-                    ]:
-                        m = re.search(pattern, html)
-                        if m:
-                            social_links[key] = f"https://{key}.com/{m.group(1)}"
-        except Exception:
-            pass
-
-    comp["scraped_content"] = scraped
-    comp["social_links"] = social_links
-    comp["ai_analysis"] = await _ai_analyze_competitor(comp, req)
-    return comp
-
-
-async def _analyze_competitor_no_web(comp: dict, req: CompetitorRequest) -> dict:
-    """AI analysis without website — based on name, rating, location."""
-    comp["ai_analysis"] = await _ai_analyze_competitor(comp, req)
-    return comp
-
-
-async def _ai_analyze_competitor(comp: dict, req: CompetitorRequest) -> dict:
-    """Generate AI analysis for a competitor.
-    Uses req.ai_api_key if provided, else falls back to GEMINI_API_KEY env var.
-    """
-    scraped = comp.get("scraped_content", "")
-    website_section = f"\nWebsite Content:\n{scraped[:2000]}" if scraped else ""
-
-    rating_str = f"{comp.get('rating', 'N/A')} ★ ({comp.get('reviews', 0)} reviews)"
-    dist_str = f"  Distance: {comp.get('distance_km')} km" if comp.get("distance_km") else ""
-    addr_str = comp.get("address") or req.location
-
-    prompt = f"""You are an expert social media marketing analyst. Analyze this REAL local competitor.
-
-COMPETITOR (real Google Maps data):
-Name: {comp.get('name', 'Unknown')}
-Address: {addr_str}{dist_str}
-Rating: {rating_str}
-Category: {comp.get('category', '')}
-Phone: {comp.get('phone', 'N/A')}
-Website: {comp.get('website', 'N/A')}
-Search Keywords: {', '.join(req.keywords)}{website_section}
-
-Based on this REAL data, generate a detailed competitor analysis.
-Use the rating/reviews to derive strength_score (higher rating + more reviews = higher score).
-Return ONLY this JSON (no markdown, no explanation):
-{{
-  "strength_score": <0-100 integer based on real rating and reviews>,
-  "threat_level": "High" | "Medium" | "Low",
-  "best_content": ["content insight 1", "content insight 2", "content insight 3"],
-  "hook_style": ["hook style 1", "hook style 2"],
-  "posting_pattern": "likely posting frequency and content mix",
-  "offer_types": ["offer 1", "offer 2"],
-  "visual_style": "their likely visual branding style",
-  "weaknesses": ["weakness 1", "weakness 2", "weakness 3"],
-  "opportunities": ["opportunity for you 1", "opportunity 2", "opportunity 3"],
-  "summary": "one line summary of this competitor and their main threat"
-}}"""
-
-    # Resolve AI key: use passed key, fallback to env var (Railway variable)
-    ai_key = req.ai_api_key or os.environ.get("GEMINI_API_KEY", "")
-    provider = req.ai_provider if req.ai_api_key else "gemini"
-
-    try:
-        raw = ""
-        if provider == "gemini" and ai_key:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={ai_key}"
-            raw = await _call_ai_api(url, prompt, {})
-        elif provider == "groq" and ai_key:
-            async with httpx.AsyncClient(timeout=25) as client:
-                r = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {ai_key}", "Content-Type": "application/json"},
-                    json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}], "max_tokens": 800}
-                )
-                raw = r.json()["choices"][0]["message"]["content"]
-        elif provider == "openai" and ai_key:
-            async with httpx.AsyncClient(timeout=25) as client:
-                r = await client.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {ai_key}", "Content-Type": "application/json"},
-                    json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "max_tokens": 800}
-                )
-                raw = r.json()["choices"][0]["message"]["content"]
-
-        cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
-        start = cleaned.find("{")
-        end = cleaned.rfind("}") + 1
-        if start >= 0 and end > start:
-            return json.loads(cleaned[start:end])
-    except Exception:
-        pass
-
-    # Fallback
-    return {
-        "strength_score": 50,
-        "threat_level": "Medium",
-        "best_content": ["Social media presence", "Local community engagement"],
-        "hook_style": ["Local relevance", "Customer reviews"],
-        "posting_pattern": "Regular posting, 3-5 times per week",
-        "offer_types": ["Standard offers", "Seasonal promotions"],
-        "visual_style": "Professional branding with local appeal",
-        "weaknesses": ["Limited online presence data available"],
-        "opportunities": ["Engage more on social media", "Target younger demographics"],
-        "summary": f"Local competitor in {req.location} space",
-    }
-
-
 @app.post("/scrape")
 async def scrape_url(req: ScrapeRequest):
     """
@@ -1078,72 +499,6 @@ async def scrape_url(req: ScrapeRequest):
     if not content:
         raise HTTPException(status_code=422, detail="Could not extract content from URL")
     return {"success": True, "content": content, "url": req.url}
-
-
-# ══════════════════════════════════════════════════════════════
-#  VIDEO GENERATION — HuggingFace SDK → Replicate → Wan2.2-T2V-A14B
-#
-#  HF token comes from Flutter (admin sets it in Admin Panel →
-#  saved to Firestore system_config/video_config → Flutter reads
-#  it and passes as hf_token in request body).
-#
-#  Exact same as working Colab:
-#    from huggingface_hub import InferenceClient
-#    client = InferenceClient(provider="replicate", api_key=hf_token)
-#    video = client.text_to_video("...", model="Wan-AI/Wan2.2-T2V-A14B")
-# ══════════════════════════════════════════════════════════════
-class VideoGenerateRequest(BaseModel):
-    prompt: str
-    hf_token: str  # from Admin Panel → Firestore → Flutter
-
-@app.post("/generate-video")
-async def generate_video(req: VideoGenerateRequest):
-    import base64
-    from concurrent.futures import ThreadPoolExecutor
-    from huggingface_hub import InferenceClient
-
-    # Fallback to Railway env var if Flutter didn't send a token
-    hf_token = req.hf_token or os.environ.get("HF_TOKEN", "")
-    if not hf_token:
-        raise HTTPException(status_code=500, detail="HF token missing. Admin Panel → API Keys → AI Video Creator → HuggingFace Token set karo.")
-
-    full_prompt = (
-        f"{req.prompt}. "
-        "Cinematic, dramatic lighting, smooth camera motion, Instagram reel style, 5 seconds."
-    )
-
-    def _run_sync():
-        client = InferenceClient(
-            provider="replicate",
-            api_key=hf_token,
-        )
-        video_bytes = client.text_to_video(
-            full_prompt,
-            model="Wan-AI/Wan2.2-T2V-A14B",
-        )
-        return video_bytes
-
-    try:
-        loop = asyncio.get_event_loop()
-        with ThreadPoolExecutor() as pool:
-            video_bytes = await asyncio.wait_for(
-                loop.run_in_executor(pool, _run_sync),
-                timeout=300,
-            )
-
-        if not video_bytes:
-            raise HTTPException(status_code=500, detail="Video generation returned empty bytes")
-
-        return {
-            "success": True,
-            "video_b64": base64.b64encode(video_bytes).decode(),
-            "content_type": "video/mp4",
-        }
-
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Video generation timed out (5 min limit)")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Video Gen Failed: {str(e)}")
 
 
 if __name__ == "__main__":
